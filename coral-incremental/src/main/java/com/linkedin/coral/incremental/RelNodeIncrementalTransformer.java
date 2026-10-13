@@ -1,5 +1,5 @@
 /**
- * Copyright 2023 LinkedIn Corporation. All rights reserved.
+ * Copyright 2023-2026 LinkedIn Corporation. All rights reserved.
  * Licensed under the BSD-2 Clause license.
  * See LICENSE in the project root for license information.
  */
@@ -29,6 +29,9 @@ import org.apache.calcite.rex.RexNode;
 
 public class RelNodeIncrementalTransformer {
 
+  private static final String INSERT_DELTA_SUFFIX = "_delta";
+  private static final String DELETE_DELTA_SUFFIX = "_delete_delta";
+
   private RelNodeIncrementalTransformer() {
   }
 
@@ -36,13 +39,7 @@ public class RelNodeIncrementalTransformer {
     RelShuttle converter = new RelShuttleImpl() {
       @Override
       public RelNode visit(TableScan scan) {
-        RelOptTable originalTable = scan.getTable();
-        List<String> incrementalNames = new ArrayList<>(originalTable.getQualifiedName());
-        String deltaTableName = incrementalNames.remove(incrementalNames.size() - 1) + "_delta";
-        incrementalNames.add(deltaTableName);
-        RelOptTable incrementalTable =
-            RelOptTableImpl.create(originalTable.getRelOptSchema(), originalTable.getRowType(), incrementalNames, null);
-        return LogicalTableScan.create(scan.getCluster(), incrementalTable);
+        return createDeltaTableScan(scan, INSERT_DELTA_SUFFIX);
       }
 
       @Override
@@ -51,21 +48,38 @@ public class RelNodeIncrementalTransformer {
         RelNode right = join.getRight();
         RelNode incrementalLeft = convertRelIncremental(left);
         RelNode incrementalRight = convertRelIncremental(right);
+        RelNode deleteDeltaLeft = convertRelDeleteDelta(left);
+        RelNode deleteDeltaRight = convertRelDeleteDelta(right);
 
         RexBuilder rexBuilder = join.getCluster().getRexBuilder();
 
-        LogicalProject p1 = createProjectOverJoin(join, left, incrementalRight, rexBuilder);
-        LogicalProject p2 = createProjectOverJoin(join, incrementalLeft, right, rexBuilder);
-        LogicalProject p3 = createProjectOverJoin(join, incrementalLeft, incrementalRight, rexBuilder);
+        LogicalProject insertP1 = createProjectOverJoin(join, left, incrementalRight, rexBuilder);
+        LogicalProject insertP2 = createProjectOverJoin(join, incrementalLeft, right, rexBuilder);
+        LogicalProject insertP3 = createProjectOverJoin(join, incrementalLeft, incrementalRight, rexBuilder);
 
-        LogicalUnion unionAllJoins =
-            LogicalUnion.create(Arrays.asList(LogicalUnion.create(Arrays.asList(p1, p2), true), p3), true);
-        return unionAllJoins;
+        LogicalProject deleteP1 = createProjectOverJoin(join, left, deleteDeltaRight, rexBuilder);
+        LogicalProject deleteP2 = createProjectOverJoin(join, deleteDeltaLeft, right, rexBuilder);
+        LogicalProject deleteP3 = createProjectOverJoin(join, deleteDeltaLeft, deleteDeltaRight, rexBuilder);
+
+        RelNode insertBranches = LogicalUnion
+            .create(Arrays.asList(LogicalUnion.create(Arrays.asList(insertP1, insertP2), true), insertP3), true);
+        RelNode deleteBranches = LogicalUnion
+            .create(Arrays.asList(LogicalUnion.create(Arrays.asList(deleteP1, deleteP2), true), deleteP3), true);
+        return LogicalUnion.create(Arrays.asList(insertBranches, deleteBranches), true);
       }
 
       @Override
       public RelNode visit(LogicalFilter filter) {
-        RelNode transformedChild = convertRelIncremental(filter.getInput());
+        RelNode input = filter.getInput();
+        if (input instanceof TableScan) {
+          TableScan scan = (TableScan) input;
+          RelNode filteredInsertDelta =
+              LogicalFilter.create(createDeltaTableScan(scan, INSERT_DELTA_SUFFIX), filter.getCondition());
+          RelNode filteredDeleteDelta =
+              LogicalFilter.create(createDeltaTableScan(scan, DELETE_DELTA_SUFFIX), filter.getCondition());
+          return LogicalUnion.create(Arrays.asList(filteredInsertDelta, filteredDeleteDelta), true);
+        }
+        RelNode transformedChild = convertRelIncremental(input);
         return LogicalFilter.create(transformedChild, filter.getCondition());
       }
 
@@ -91,6 +105,26 @@ public class RelNodeIncrementalTransformer {
       }
     };
     return originalNode.accept(converter);
+  }
+
+  private static RelNode convertRelDeleteDelta(RelNode originalNode) {
+    RelShuttle converter = new RelShuttleImpl() {
+      @Override
+      public RelNode visit(TableScan scan) {
+        return createDeltaTableScan(scan, DELETE_DELTA_SUFFIX);
+      }
+    };
+    return originalNode.accept(converter);
+  }
+
+  private static RelNode createDeltaTableScan(TableScan scan, String deltaSuffix) {
+    RelOptTable originalTable = scan.getTable();
+    List<String> incrementalNames = new ArrayList<>(originalTable.getQualifiedName());
+    String deltaTableName = incrementalNames.remove(incrementalNames.size() - 1) + deltaSuffix;
+    incrementalNames.add(deltaTableName);
+    RelOptTable incrementalTable =
+        RelOptTableImpl.create(originalTable.getRelOptSchema(), originalTable.getRowType(), incrementalNames, null);
+    return LogicalTableScan.create(scan.getCluster(), incrementalTable);
   }
 
   private static LogicalProject createProjectOverJoin(LogicalJoin join, RelNode left, RelNode right,
